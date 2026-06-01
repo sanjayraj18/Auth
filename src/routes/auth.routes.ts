@@ -5,6 +5,7 @@ import jwt from "jsonwebtoken";
 import config from "../config/config";
 import sessionModel from "../models/session.schema";
 import userModel from "../models/user.schema";
+import { TokenService } from "../services/tokenService";
 
 interface TokenPayload {
   id: string;
@@ -57,6 +58,21 @@ authRouter.post("/signup", async (req, res) => {
     ip: req.ip,
     userAgent: req.header("user-agent"),
   });
+
+  //redis inclusion to store the session
+  await TokenService.storeSession(
+    session._id.toString(),
+    user._id.toString(),
+    req.ip || "unknown",
+    req.header("user-agent") || "unknow",
+  );
+
+  //redis to store the refreshToken
+  await TokenService.storeRefreshToken(
+    refreshTokenHash,
+    user._id.toString(),
+    session._id.toString(),
+  );
 
   const accessToken = jwt.sign(
     {
@@ -131,6 +147,21 @@ authRouter.post("/signin", async (req, res) => {
     userAgent: req.header("user-agent"),
   });
 
+  //redis to store the session
+  await TokenService.storeSession(
+    session._id.toString(),
+    userId.toString(),
+    req.ip || "unknown",
+    req.header("user-agent") || "unknown",
+  );
+
+  //redis to store the refreshTokenHash
+  await TokenService.storeRefreshToken(
+    refreshTokenHash,
+    userId.toString(),
+    session._id.toString(),
+  );
+
   const accessToken = jwt.sign(
     {
       id: userId,
@@ -188,19 +219,26 @@ authRouter.get("/refresh", async (req, res) => {
     .update(refreshToken)
     .digest("hex");
 
-  const session = await sessionModel.findOne({
-    refreshToken: refreshTokenHash,
-    revoked: false,
-  });
-  if (!session) {
+  //search the refreshToken in redis
+  const tokenData = await TokenService.getRefreshToken(refreshTokenHash);
+  if (!tokenData) {
     return res.status(401).json({
-      message: "user logged out",
+      message: "token expired or invalid",
+      code: "TOKEN_INVALID",
     });
   }
 
   const decoded = jwt.verify(refreshToken, config.JWT_SECRET) as TokenPayload;
 
-  const accessToken = jwt.sign(
+  // redis to get the current session
+  const session = await TokenService.getSession(tokenData.sessionId);
+  if (!session) {
+    return res.status(401).json({
+      message: "session not found",
+    });
+  }
+
+  const newaccessToken = jwt.sign(
     {
       id: decoded.id,
       sessionId: session._id,
@@ -226,8 +264,20 @@ authRouter.get("/refresh", async (req, res) => {
     .update(newrefreshToken)
     .digest("hex");
 
-  session.refreshToken = newrefreshTokenHash;
-  await session.save();
+  // Update in MongoDB for audit trail
+  const sessionDoc = await sessionModel.findById(tokenData.sessionId);
+  if (sessionDoc) {
+    sessionDoc.refreshToken = newrefreshTokenHash;
+    await sessionDoc.save();
+  }
+
+  // Update in Redis with new token - NEW
+  await TokenService.revokeRefreshToken(refreshTokenHash);
+  await TokenService.storeRefreshToken(
+    newrefreshTokenHash,
+    decoded.id,
+    tokenData.sessionId,
+  );
 
   res.cookie("refreshToken", newrefreshToken, {
     httpOnly: true,
@@ -238,7 +288,7 @@ authRouter.get("/refresh", async (req, res) => {
 
   res.status(200).json({
     message: "AccessToken refreshed successfully",
-    accessToken,
+    newaccessToken,
   });
 });
 
@@ -255,18 +305,23 @@ authRouter.post("/logout", async (req, res) => {
     .update(refreshToken)
     .digest("hex");
 
-  const session = await sessionModel.findOne({
-    refreshToken: refreshTokenHash,
-    revoked: false,
-  });
-  if (!session) {
+  // Get token data from Redis
+  const tokenData = await TokenService.getRefreshToken(refreshTokenHash);
+  if (!tokenData) {
     return res.status(400).json({
       message: "session not found",
     });
   }
 
-  session.revoked = true;
-  session.save();
+  // Delete from Redis immediately - NEW (instant logout)
+  await TokenService.revokeRefreshToken(refreshTokenHash);
+  await TokenService.revokeSession(tokenData.sessionId);
+
+  const session = await sessionModel.findById(tokenData.sessionId);
+  if (session) {
+    session.revoked = true;
+    await session.save();
+  }
 
   res.clearCookie("refreshToken");
 
