@@ -3,11 +3,12 @@ import crypto from "crypto";
 import { Router } from "express";
 import jwt from "jsonwebtoken";
 import config from "../config/config";
+import { VerifyAccessToken } from "../middleware/authMiddleware";
 import sessionModel from "../models/session.schema";
 import userModel from "../models/user.schema";
 import { TokenService } from "../services/tokenService";
 
-interface TokenPayload {
+export interface TokenPayload {
   id: string;
 }
 
@@ -186,17 +187,8 @@ authRouter.post("/signin", async (req, res) => {
   });
 });
 
-authRouter.get("/getme", async (req, res) => {
-  const token = req.headers.authorization?.split(" ")[1];
-
-  if (!token) {
-    res.status(401).json({
-      message: "token not found",
-    });
-  }
-
-  const decoded = jwt.verify(token!, config.JWT_SECRET) as TokenPayload;
-  const user = await userModel.findById(decoded.id);
+authRouter.get("/getme", VerifyAccessToken, async (req: any, res) => {
+  const user = await userModel.findById(req.userId);
 
   res.status(200).json({
     message: "user fetched succesfully",
