@@ -1,7 +1,7 @@
-import redis from "redis";
+import { createClient } from "redis";
 import config from "./config";
 
-const redisClient = redis.createClient({
+const redisClient = createClient({
   socket: {
     host: config.REDIS_HOST,
     port: config.REDIS_PORT,
